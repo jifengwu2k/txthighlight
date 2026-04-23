@@ -12,14 +12,17 @@ import time
 import uuid
 
 if sys.version_info >= (3,):
+    from html import escape as html_escape
     from http.server import BaseHTTPRequestHandler, HTTPServer
     from socketserver import ThreadingMixIn
-    from urllib.parse import urlparse
+    from urllib.parse import parse_qs, quote, unquote, urlparse
     text_type = str
 else:
     from BaseHTTPServer import BaseHTTPRequestHandler, HTTPServer
     from SocketServer import ThreadingMixIn
-    from urlparse import urlparse
+    from cgi import escape as html_escape
+    from urlparse import parse_qs, urlparse
+    from urllib import quote, unquote
     text_type = unicode
 
 
@@ -51,6 +54,11 @@ HTML_PAGE = """<!DOCTYPE html>
   </style>
 </head>
 <body>
+  <div id=\"header\">
+    <h1 id=\"fileName\">Text Highlighter</h1>
+    <div id=\"filePath\"></div>
+  </div>
+
   <div id=\"document\"></div>
 
   <div id=\"selectionToolbar\" hidden>
@@ -88,13 +96,20 @@ HTML_PAGE = """<!DOCTYPE html>
       text: '',
       annotations: [],
       fileName: '',
+      filePath: '',
       metadataPath: '',
       selection: null,
       highlightId: null,
       commentTargetId: null,
     };
 
+    const currentPath = window.location.pathname;
+    const documentApiPath = `/api/document?path=${encodeURIComponent(currentPath)}`;
+    const highlightsApiPath = `/api/highlights?path=${encodeURIComponent(currentPath)}`;
+
     const docEl = document.getElementById('document');
+    const fileNameEl = document.getElementById('fileName');
+    const filePathEl = document.getElementById('filePath');
     const selectionToolbarEl = document.getElementById('selectionToolbar');
     const highlightToolbarEl = document.getElementById('highlightToolbar');
     const commentModalEl = document.getElementById('commentModal');
@@ -130,6 +145,9 @@ HTML_PAGE = """<!DOCTYPE html>
     }
 
     function renderDocument() {
+      fileNameEl.textContent = state.fileName || 'Text Highlighter';
+      filePathEl.textContent = state.filePath || '';
+
       const annotations = [...state.annotations].sort((a, b) => a.start - b.start || a.end - b.end);
       let cursor = 0;
       let html = '';
@@ -235,13 +253,6 @@ HTML_PAGE = """<!DOCTYPE html>
       window.setTimeout(() => commentBoxEl.focus(), 0);
     }
 
-    function closeCommentDialog() {
-      commentModalEl.dataset.targetId = '';
-      if (commentModalEl.open) {
-        commentModalEl.close();
-      }
-    }
-
     function renderUI() {
       hideSelectionToolbar();
       hideHighlightToolbar();
@@ -273,6 +284,7 @@ HTML_PAGE = """<!DOCTYPE html>
           state.text = payload.text || '';
           state.annotations = payload.annotations || [];
           state.fileName = payload.file_name || '';
+          state.filePath = payload.file_path || '';
           state.metadataPath = payload.metadata_path || '';
           state.mode = Mode.IDLE;
           state.selection = null;
@@ -372,7 +384,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
     async function mutate(payload) {
       try {
-        const data = await api('/api/highlights', payload);
+        const data = await api(highlightsApiPath, payload);
         transition('ANNOTATIONS_UPDATED', { annotations: data.annotations });
         return data.annotations;
       } catch (error) {
@@ -383,8 +395,11 @@ HTML_PAGE = """<!DOCTYPE html>
     }
 
     async function loadDocument() {
-      const response = await fetch('/api/document');
+      const response = await fetch(documentApiPath);
       const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || `HTTP ${response.status}`);
+      }
       transition('DOCUMENT_LOADED', data);
     }
 
@@ -514,105 +529,20 @@ HTML_PAGE = """<!DOCTYPE html>
 """
 
 
-class AppState(object):
-    def __init__(self, text_path, metadata_path, text, lock):
-        # type: (text_type, text_type, text_type, threading.Lock) -> None
-        self.text_path = text_path
-        self.metadata_path = metadata_path
-        self.text = text
-        self.lock = lock
-        self._ensure_metadata_file()
+class RequestPathError(Exception):
+    pass
 
-    def _ensure_metadata_file(self):
-        # type: () -> None
-        if os.path.exists(self.metadata_path):
-            return
-        payload = {
-            "source_file": self.text_path,
-            "annotations": [],
-        }
-        with codecs.open(self.metadata_path, "w", encoding="utf-8") as f:
-            f.write(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
 
-    def _load_annotations(self):
-        # type: () -> list
-        try:
-            with codecs.open(self.metadata_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except ValueError:
-            raise ValueError("Invalid JSON in metadata file: %s" % self.metadata_path)
-        annotations = data.get("annotations", [])
-        if not isinstance(annotations, list):
-            raise ValueError("Metadata JSON must contain an 'annotations' array")
-        normalized = []
-        for item in annotations:
-            try:
-                start = int(item["start"])
-                end = int(item["end"])
-            except Exception as exc:
-                raise ValueError("Every annotation must have integer start/end offsets: %s" % exc)
-            if not (0 <= start < end <= len(self.text)):
-                continue
-            normalized.append(
-                {
-                    "id": str(item.get("id") or uuid.uuid4()),
-                    "start": start,
-                    "end": end,
-                    "comment": str(item.get("comment") or ""),
-                    "created_at": int(item.get("created_at") or now_timestamp()),
-                    "updated_at": int(item.get("updated_at") or now_timestamp()),
-                }
-            )
-        normalized.sort(key=lambda ann: (ann["start"], ann["end"], ann["id"]))
-        return normalized
+class RequestNotFoundError(RequestPathError):
+    pass
 
-    def _save_annotations(self, annotations):
-        # type: (list) -> None
-        payload = {
-            "source_file": self.text_path,
-            "annotations": annotations,
-        }
-        with codecs.open(self.metadata_path, "w", encoding="utf-8") as f:
-            f.write(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
 
-    def document_payload(self):
-        # type: () -> dict
-        with self.lock:
-            annotations = self._load_annotations()
-        return {
-            "file_name": os.path.basename(self.text_path),
-            "file_path": self.text_path,
-            "metadata_path": self.metadata_path,
-            "text": self.text,
-            "annotations": annotations,
-        }
+class RequestIsDirectoryError(RequestPathError):
+    pass
 
-    def mutate(self, payload):
-        # type: (dict) -> list
-        action = payload.get("action")
-        with self.lock:
-            annotations = self._load_annotations()
-            if action == "add":
-                start = clamp_index(payload.get("start"), len(self.text))
-                end = clamp_index(payload.get("end"), len(self.text))
-                comment = str(payload.get("comment") or "")
-                annotations = add_annotation(annotations, start, end, comment)
-            elif action == "remove_range":
-                start = clamp_index(payload.get("start"), len(self.text))
-                end = clamp_index(payload.get("end"), len(self.text))
-                annotations = remove_range(annotations, start, end)
-            elif action == "update_comment":
-                ann_id = str(payload.get("id") or "")
-                comment = str(payload.get("comment") or "")
-                annotations = update_comment(annotations, ann_id, comment)
-            elif action == "remove_id":
-                ann_id = str(payload.get("id") or "")
-                annotations = [ann for ann in annotations if ann["id"] != ann_id]
-            else:
-                raise ValueError("Unsupported action: %s" % action)
-            annotations.sort(key=lambda ann: (ann["start"], ann["end"], ann["id"]))
-            self._save_annotations(annotations)
-            return annotations
+
+class InvalidTextFileError(ValueError):
+    pass
 
 
 def now_timestamp():
@@ -624,6 +554,116 @@ def clamp_index(value, maximum):
     # type: (object, int) -> int
     number = int(value)
     return max(0, min(maximum, number))
+
+
+def uri_component_to_text(component):
+    # type: (text_type) -> text_type
+    decoded = unquote(component)
+    if not isinstance(decoded, text_type):
+        decoded = decoded.decode("utf-8")
+    return decoded
+
+
+def text_to_uri_component(value):
+    # type: (text_type) -> text_type
+    if sys.version_info >= (3,):
+        return quote(value, safe="")
+    return quote(value.encode("utf-8"), safe="")
+
+
+def uri_path_to_unicode_path_components(uri_path):
+    # type: (text_type) -> list
+    parsed_path = urlparse(uri_path).path
+    return [uri_component_to_text(component) for component in parsed_path.split("/") if component]
+
+
+def unicode_path_components_to_uri_path(unicode_path_components, force_directory=False):
+    # type: (list, bool) -> text_type
+    if not unicode_path_components:
+        return "/"
+    encoded = [text_to_uri_component(component) for component in unicode_path_components]
+    uri_path = "/" + "/".join(encoded)
+    if force_directory and not uri_path.endswith("/"):
+        uri_path += "/"
+    return uri_path
+
+
+def unicode_path_components_to_filesystem_path(root_directory_path, unicode_path_components):
+    # type: (text_type, list) -> text_type
+    absolute_root_directory_path = os.path.realpath(root_directory_path)
+    absolute_file_path = os.path.realpath(
+        os.path.join(absolute_root_directory_path, *unicode_path_components)  # type: ignore
+    )
+    if (
+        absolute_file_path == absolute_root_directory_path
+        or absolute_file_path.startswith(absolute_root_directory_path + os.sep)
+    ):
+        return absolute_file_path
+    return None
+
+
+def ensure_metadata_file(text_path, metadata_path):
+    # type: (text_type, text_type) -> None
+    if os.path.exists(metadata_path):
+        return
+    payload = {
+        "source_file": text_path,
+        "annotations": [],
+    }
+    with codecs.open(metadata_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+
+
+def load_text(text_path):
+    # type: (text_type) -> text_type
+    try:
+        with codecs.open(text_path, "r", encoding="utf-8") as f:
+            return f.read()
+    except UnicodeDecodeError:
+        raise InvalidTextFileError("Only UTF-8 text files are supported: %s" % text_path)
+
+
+def load_annotations(metadata_path, text_path, text):
+    # type: (text_type, text_type, text_type) -> list
+    try:
+        with codecs.open(metadata_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except ValueError:
+        raise ValueError("Invalid JSON in metadata file: %s" % metadata_path)
+    annotations = data.get("annotations", [])
+    if not isinstance(annotations, list):
+        raise ValueError("Metadata JSON must contain an 'annotations' array")
+    normalized = []
+    for item in annotations:
+        try:
+            start = int(item["start"])
+            end = int(item["end"])
+        except Exception as exc:
+            raise ValueError("Every annotation must have integer start/end offsets: %s" % exc)
+        if not (0 <= start < end <= len(text)):
+            continue
+        normalized.append(
+            {
+                "id": str(item.get("id") or uuid.uuid4()),
+                "start": start,
+                "end": end,
+                "comment": str(item.get("comment") or ""),
+                "created_at": int(item.get("created_at") or now_timestamp()),
+                "updated_at": int(item.get("updated_at") or now_timestamp()),
+            }
+        )
+    normalized.sort(key=lambda ann: (ann["start"], ann["end"], ann["id"]))
+    return normalized
+
+
+def save_annotations(metadata_path, text_path, annotations):
+    # type: (text_type, text_type, list) -> None
+    payload = {
+        "source_file": text_path,
+        "annotations": annotations,
+    }
+    with codecs.open(metadata_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
 
 
 def add_annotation(annotations, start, end, comment):
@@ -720,8 +760,77 @@ def update_comment(annotations, ann_id, comment):
     return updated
 
 
+class AppState(object):
+    def __init__(self, root_path, lock):
+        # type: (text_type, threading.Lock) -> None
+        self.root_path = os.path.realpath(root_path)
+        self.lock = lock
+
+    def filesystem_path_from_uri_path(self, uri_path):
+        # type: (text_type) -> text_type
+        components = uri_path_to_unicode_path_components(uri_path)
+        return unicode_path_components_to_filesystem_path(self.root_path, components)
+
+    def _require_existing_file(self, uri_path):
+        # type: (text_type) -> text_type
+        filesystem_path = self.filesystem_path_from_uri_path(uri_path)
+        if filesystem_path is None or not os.path.exists(filesystem_path):
+            raise RequestNotFoundError("File not found: %s" % uri_path)
+        if os.path.isdir(filesystem_path):
+            raise RequestIsDirectoryError("Path is a directory: %s" % uri_path)
+        return filesystem_path
+
+    def document_payload(self, uri_path):
+        # type: (text_type) -> dict
+        text_path = self._require_existing_file(uri_path)
+        metadata_path = text_path + ".json"
+        text = load_text(text_path)
+        with self.lock:
+            ensure_metadata_file(text_path, metadata_path)
+            annotations = load_annotations(metadata_path, text_path, text)
+        return {
+            "file_name": os.path.basename(text_path),
+            "file_path": text_path,
+            "metadata_path": metadata_path,
+            "text": text,
+            "annotations": annotations,
+        }
+
+    def mutate(self, uri_path, payload):
+        # type: (text_type, dict) -> list
+        text_path = self._require_existing_file(uri_path)
+        metadata_path = text_path + ".json"
+        text = load_text(text_path)
+        action = payload.get("action")
+
+        with self.lock:
+            ensure_metadata_file(text_path, metadata_path)
+            annotations = load_annotations(metadata_path, text_path, text)
+            if action == "add":
+                start = clamp_index(payload.get("start"), len(text))
+                end = clamp_index(payload.get("end"), len(text))
+                comment = str(payload.get("comment") or "")
+                annotations = add_annotation(annotations, start, end, comment)
+            elif action == "remove_range":
+                start = clamp_index(payload.get("start"), len(text))
+                end = clamp_index(payload.get("end"), len(text))
+                annotations = remove_range(annotations, start, end)
+            elif action == "update_comment":
+                ann_id = str(payload.get("id") or "")
+                comment = str(payload.get("comment") or "")
+                annotations = update_comment(annotations, ann_id, comment)
+            elif action == "remove_id":
+                ann_id = str(payload.get("id") or "")
+                annotations = [ann for ann in annotations if ann["id"] != ann_id]
+            else:
+                raise ValueError("Unsupported action: %s" % action)
+            annotations.sort(key=lambda ann: (ann["start"], ann["end"], ann["id"]))
+            save_annotations(metadata_path, text_path, annotations)
+            return annotations
+
+
 class HighlighterHandler(BaseHTTPRequestHandler):
-    server_version = "TextHighlighter/1.0"
+    server_version = "TextHighlighter/1.1"
 
     @property
     def app_state(self):
@@ -730,21 +839,38 @@ class HighlighterHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         # type: () -> None
-        path = urlparse(self.path).path
-        if path == "/":
-            self._send_html(HTML_PAGE)
-            return
+        parsed = urlparse(self.path)
+        path = parsed.path
+
         if path == "/api/document":
-            self._send_json(self.app_state.document_payload())
+            target_path = first_query_value(parse_qs(parsed.query), "path", "/")
+            self._handle_document_request(target_path)
             return
-        self._send_json({"error": "Not found"}, status=HTTP_NOT_FOUND)
+
+        filesystem_path = self.app_state.filesystem_path_from_uri_path(path)
+        if filesystem_path is None or not os.path.exists(filesystem_path):
+            self._send_json({"error": "Not found"}, status=HTTP_NOT_FOUND)
+            return
+        if os.path.isdir(filesystem_path):
+            html = render_directory_listing(self.app_state.root_path, path, filesystem_path)
+            self._send_html(html)
+            return
+        try:
+            load_text(filesystem_path)
+        except InvalidTextFileError as exc:
+            self._send_html(render_error_page(str(exc)), status=HTTP_BAD_REQUEST)
+            return
+        self._send_html(HTML_PAGE)
 
     def do_POST(self):
         # type: () -> None
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
         if path != "/api/highlights":
             self._send_json({"error": "Not found"}, status=HTTP_NOT_FOUND)
             return
+
+        target_path = first_query_value(parse_qs(parsed.query), "path", "/")
 
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -760,7 +886,13 @@ class HighlighterHandler(BaseHTTPRequestHandler):
             else:
                 body = "{}"
             payload = json.loads(body)
-            annotations = self.app_state.mutate(payload)
+            annotations = self.app_state.mutate(target_path, payload)
+        except RequestNotFoundError as exc:
+            self._send_json({"error": str(exc)}, status=HTTP_NOT_FOUND)
+            return
+        except RequestIsDirectoryError as exc:
+            self._send_json({"error": str(exc)}, status=HTTP_BAD_REQUEST)
+            return
         except ValueError as exc:
             self._send_json({"error": str(exc)}, status=HTTP_BAD_REQUEST)
             return
@@ -769,6 +901,24 @@ class HighlighterHandler(BaseHTTPRequestHandler):
             return
 
         self._send_json({"ok": True, "annotations": annotations})
+
+    def _handle_document_request(self, target_path):
+        # type: (text_type) -> None
+        try:
+            payload = self.app_state.document_payload(target_path)
+        except RequestNotFoundError as exc:
+            self._send_json({"error": str(exc)}, status=HTTP_NOT_FOUND)
+            return
+        except RequestIsDirectoryError as exc:
+            self._send_json({"error": str(exc)}, status=HTTP_BAD_REQUEST)
+            return
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=HTTP_BAD_REQUEST)
+            return
+        except Exception as exc:
+            self._send_json({"error": str(exc)}, status=HTTP_INTERNAL_SERVER_ERROR)
+            return
+        self._send_json(payload)
 
     def log_message(self, fmt, *args):
         # type: (text_type, *object) -> None
@@ -794,12 +944,151 @@ class HighlighterHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+def first_query_value(query, name, default=""):
+    # type: (dict, text_type, text_type) -> text_type
+    values = query.get(name)
+    if not values:
+        return default
+    return values[0]
+
+
+def render_error_page(message):
+    # type: (text_type) -> text_type
+    return u"\n".join(
+        [
+            u"<!DOCTYPE html>",
+            u"<html>",
+            u"<head>",
+            u"<meta charset='utf-8'>",
+            u"<meta name='viewport' content='width=device-width, initial-scale=1'>",
+            u"<title>Text Highlighter Error</title>",
+            u"</head>",
+            u"<body>",
+            u"<h1>Cannot open file</h1>",
+            u"<p class='error'>%s</p>" % html_escape(message, True),
+            u"</body>",
+            u"</html>",
+        ]
+    )
+
+
+def is_sidecar_metadata_file(filesystem_entry_path):
+    # type: (text_type) -> bool
+    if not os.path.isfile(filesystem_entry_path):
+        return False
+    if not filesystem_entry_path.endswith(".json"):
+        return False
+    source_path = filesystem_entry_path[:-5]
+    return os.path.isfile(source_path)
+
+
+LIKELY_TEXT_EXTENSIONS = set(
+    [
+        "txt", "text", "md", "rst", "log", "csv", "tsv", "jsonl",
+        "ini", "cfg", "conf", "toml", "yaml", "yml", "xml", "html", "css",
+        "py", "js", "ts", "tsx", "jsx", "c", "cc", "cpp", "h", "hpp",
+        "java", "go", "rs", "sh", "bat", "ps1", "sql",
+    ]
+)
+
+
+def is_likely_annotatable_text_file(filesystem_entry, filesystem_entry_path):
+    # type: (text_type, text_type) -> bool
+    if not os.path.isfile(filesystem_entry_path):
+        return False
+    if is_sidecar_metadata_file(filesystem_entry_path):
+        return False
+    if u"." not in filesystem_entry:
+        return True
+    extension = filesystem_entry.rsplit(u".", 1)[-1].lower()
+    return extension in LIKELY_TEXT_EXTENSIONS
+
+
+def render_directory_listing(root_path, uri_path, filesystem_path):
+    # type: (text_type, text_type, text_type) -> text_type
+    path_components = uri_path_to_unicode_path_components(uri_path)
+    display_path = urlparse(uri_path).path or "/"
+
+    html_lines = [
+        u"<!DOCTYPE html>",
+        u"<html>",
+        u"<head>",
+        u"<meta charset='utf-8'>",
+        u"<meta name='viewport' content='width=device-width, initial-scale=1'>",
+        u"<title>Directory listing for %s</title>" % html_escape(display_path, True),
+        u"<style>",
+        u".badge-dir { background: #eef5ff; border-color: #b8d3ff; }",
+        u".badge-text { background: #eefbf0; border-color: #b8e0bd; }",
+        u".badge-sidecar { background: #f7f0ff; border-color: #d7c2ff; }",
+        u".badge-file { background: #f6f6f6; border-color: #ddd; }",
+        u"</style>",
+        u"</head>",
+        u"<body>",
+        u"<h1>Directory listing for %s</h1>" % html_escape(display_path, True),
+        u"<div class='meta'>Serving from %s</div>" % html_escape(root_path, True),
+        u"<div class='legend'>",
+        u"<span class='badge badge-dir'>directory</span>",
+        u"<span class='badge badge-text'>likely annotatable text</span>",
+        u"<span class='badge badge-sidecar'>.json sidecar</span>",
+        u"<span class='badge badge-file'>other file</span>",
+        u"</div>",
+        u"<hr>",
+        u"<ul>",
+    ]
+
+    if path_components:
+        parent_directory_uri_path = unicode_path_components_to_uri_path(path_components[:-1], True)
+        html_lines.append(u"<li><div class='entry'><a href='%s' class='name'>../</a><span class='badge badge-dir'>up</span></div></li>" % parent_directory_uri_path)
+
+    filesystem_entries = sorted(os.listdir(filesystem_path), key=lambda item: (not os.path.isdir(os.path.join(filesystem_path, item)), item.lower()))  # type: ignore
+    for filesystem_entry in filesystem_entries:
+        filesystem_entry_path = os.path.join(filesystem_path, filesystem_entry)  # type: ignore
+        is_directory = os.path.isdir(filesystem_entry_path)
+        display_name = filesystem_entry + (u"/" if is_directory else u"")
+        entry_uri_path = unicode_path_components_to_uri_path(path_components + [filesystem_entry], is_directory)
+        if is_directory:
+            badge_class = u"badge-dir"
+            badge_text = u"directory"
+        elif is_sidecar_metadata_file(filesystem_entry_path):
+            badge_class = u"badge-sidecar"
+            badge_text = u"sidecar"
+        elif is_likely_annotatable_text_file(filesystem_entry, filesystem_entry_path):
+            badge_class = u"badge-text"
+            badge_text = u"annotate"
+        else:
+            badge_class = u"badge-file"
+            badge_text = u"file"
+        html_lines.append(
+            u"<li><div class='entry'><a href='%s' class='name'>%s</a> <span class='badge %s'>%s</span></div></li>"
+            % (
+                entry_uri_path,
+                html_escape(display_name, True),
+                badge_class,
+                html_escape(badge_text, True),
+            )
+        )
+
+    html_lines += [
+        u"</ul>",
+        u"<hr>",
+        u"<p>Open a file to annotate it. Open a directory to keep browsing.</p>",
+        u"</body>",
+        u"</html>",
+    ]
+    return u"\n".join(html_lines)
+
+
 def parse_args():
     # type: () -> argparse.Namespace
     parser = argparse.ArgumentParser(
-        description="Serve a plain text file in a browser with local highlight/comment storage."
+        description="Serve a plain text file browser with local highlight/comment storage."
     )
-    parser.add_argument("text_file", help="Path to the plain text file to annotate")
+    parser.add_argument(
+        "path",
+        nargs="?",
+        default=".",
+        help="Path to a plain text file or a directory containing plain text files (default: current directory)",
+    )
     parser.add_argument("--host", default="localhost", help="Host interface to bind to")
     parser.add_argument("--port", default=8000, type=int, help="Port to listen on")
     return parser.parse_args()
@@ -808,21 +1097,29 @@ def parse_args():
 def main():
     # type: () -> None
     args = parse_args()
-    text_path = os.path.abspath(os.path.expanduser(args.text_file))
-    if not os.path.isfile(text_path):
-        raise SystemExit("Text file not found: %s" % text_path)
+    target_path = os.path.abspath(os.path.expanduser(args.path))
+    if not os.path.exists(target_path):
+        raise SystemExit("Path not found: %s" % target_path)
 
-    metadata_path = text_path + ".json"
-    with codecs.open(text_path, "r", encoding="utf-8", errors="replace") as f:
-        text = f.read()
-    app_state = AppState(text_path=text_path, metadata_path=metadata_path, text=text, lock=threading.Lock())
+    if os.path.isdir(target_path):
+        root_path = target_path
+        initial_uri_path = "/"
+        print("Serving directory %s" % root_path)
+    else:
+        load_text(target_path)
+        root_path = os.path.dirname(target_path)
+        initial_uri_path = unicode_path_components_to_uri_path([os.path.basename(target_path)])
+        print("Serving file %s" % target_path)
+
+    app_state = AppState(root_path=root_path, lock=threading.Lock())
 
     httpd = ThreadingHTTPServer((args.host, args.port), HighlighterHandler)
     httpd.app_state = app_state  # type: ignore[attr-defined]
 
-    print("Serving %s" % text_path)
-    print("Metadata file: %s" % metadata_path)
-    print("Open http://%s:%s" % (args.host, args.port))
+    print("Root directory: %s" % root_path)
+    print("Directory view: http://%s:%s/" % (args.host, args.port))
+    if initial_uri_path != "/":
+        print("Initial file: http://%s:%s%s" % (args.host, args.port, initial_uri_path))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

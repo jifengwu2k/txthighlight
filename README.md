@@ -10,10 +10,22 @@ pip install txthighlight
 
 ## Usage
 
-Run it like this:
+By default it serves the current directory:
+
+```bash
+txthighlight
+```
+
+Run it on a file:
 
 ```bash
 txthighlight --host 0.0.0.0 --port 8080 somefile.txt
+```
+
+Or on a directory:
+
+```bash
+txthighlight --host 0.0.0.0 --port 8080 ./docs
 ```
 
 Then open:
@@ -22,11 +34,15 @@ Then open:
 http://0.0.0.0:8080
 ```
 
+If you serve a directory, `/` shows a simple directory listing and you can click into files or subdirectories. The listing visually marks directories, likely annotatable text files, `.json` sidecars, and other files.
+
 Highlight metadata is stored next to the source file in:
 
 ```text
 somefile.txt.json
 ```
+
+Only UTF-8 text files are supported. Non-UTF-8 files are rejected with an error.
 
 ### What it does
 
