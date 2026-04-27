@@ -43,6 +43,18 @@ HTML_PAGE = """<!DOCTYPE html>
   <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
   <title>Text Highlighter</title>
   <style>
+    #topMenu {
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 10;
+      background: #fff;
+      padding: 8px 8px calc(8px + env(safe-area-inset-bottom));
+      display: flex;
+      gap: 8px;
+      user-select: none;
+    }
     .highlight {
       background: yellow;
     }
@@ -54,22 +66,13 @@ HTML_PAGE = """<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <div id=\"header\">
-    <h1 id=\"fileName\">Text Highlighter</h1>
-    <div id=\"filePath\"></div>
+  <div id=\"topMenu\">
+    <button id=\"highlightBtn\" disabled>Highlight</button>
+    <button id=\"commentBtn\" disabled>Comment</button>
+    <button id=\"removeBtn\" disabled>Remove</button>
   </div>
 
   <div id=\"document\"></div>
-
-  <div id=\"selectionToolbar\" hidden>
-    <button id=\"highlightBtn\">Highlight</button>
-    <button id=\"selectionCommentBtn\">Comment</button>
-  </div>
-
-  <div id=\"highlightToolbar\" hidden>
-    <button id=\"highlightCommentBtn\">Comment</button>
-    <button id=\"highlightRemoveBtn\">Remove</button>
-  </div>
 
   <dialog id=\"commentModal\">
     <form method=\"dialog\">
@@ -87,6 +90,7 @@ HTML_PAGE = """<!DOCTYPE html>
     const Mode = {
       IDLE: 'idle',
       SELECTION_ACTIVE: 'selection_active',
+      SELECTION_MENU_ACTIVE: 'selection_menu_active',
       HIGHLIGHT_ACTIVE: 'highlight_active',
       COMMENT_DIALOG: 'comment_dialog',
     };
@@ -108,10 +112,10 @@ HTML_PAGE = """<!DOCTYPE html>
     const highlightsApiPath = `/api/highlights?path=${encodeURIComponent(currentPath)}`;
 
     const docEl = document.getElementById('document');
-    const fileNameEl = document.getElementById('fileName');
-    const filePathEl = document.getElementById('filePath');
-    const selectionToolbarEl = document.getElementById('selectionToolbar');
-    const highlightToolbarEl = document.getElementById('highlightToolbar');
+    const topMenuEl = document.getElementById('topMenu');
+    const highlightBtnEl = document.getElementById('highlightBtn');
+    const commentBtnEl = document.getElementById('commentBtn');
+    const removeBtnEl = document.getElementById('removeBtn');
     const commentModalEl = document.getElementById('commentModal');
     const commentSnippetEl = document.getElementById('commentSnippet');
     const commentBoxEl = document.getElementById('commentBox');
@@ -122,6 +126,11 @@ HTML_PAGE = """<!DOCTYPE html>
       if (message) {
         window.alert(message);
       }
+    }
+
+    function syncTopMenuOffset() {
+      document.body.style.paddingTop = '0px';
+      document.body.style.paddingBottom = `${topMenuEl.offsetHeight}px`;
     }
 
     function escapeHtml(text) {
@@ -137,17 +146,7 @@ HTML_PAGE = """<!DOCTYPE html>
       return state.annotations.find((item) => item.id === id) || null;
     }
 
-    function findHighlightElById(id) {
-      if (!id) {
-        return null;
-      }
-      return docEl.querySelector(`.highlight[data-id="${id}"]`);
-    }
-
     function renderDocument() {
-      fileNameEl.textContent = state.fileName || 'Text Highlighter';
-      filePathEl.textContent = state.filePath || '';
-
       const annotations = [...state.annotations].sort((a, b) => a.start - b.start || a.end - b.end);
       let cursor = 0;
       let html = '';
@@ -199,43 +198,6 @@ HTML_PAGE = """<!DOCTYPE html>
       return start < end ? { start, end } : { start: end, end: start };
     }
 
-    function getSelectionRect() {
-      const selection = window.getSelection();
-      if (!selection || selection.rangeCount === 0 || !state.selection) {
-        return null;
-      }
-      const rect = selection.getRangeAt(0).getBoundingClientRect();
-      if (!rect || (!rect.width && !rect.height)) {
-        return null;
-      }
-      return rect;
-    }
-
-    function placeToolbar(toolbarEl, rect) {
-      toolbarEl.hidden = false;
-      toolbarEl.style.position = 'fixed';
-      toolbarEl.style.zIndex = '50';
-
-      const toolbarWidth = toolbarEl.offsetWidth;
-      const top = rect.bottom + 8;
-      const maxLeft = Math.max(10, window.innerWidth - toolbarWidth - 10);
-      const left = Math.min(
-        maxLeft,
-        Math.max(10, rect.left + rect.width / 2 - toolbarWidth / 2)
-      );
-
-      toolbarEl.style.top = `${top}px`;
-      toolbarEl.style.left = `${left}px`;
-    }
-
-    function hideSelectionToolbar() {
-      selectionToolbarEl.hidden = true;
-    }
-
-    function hideHighlightToolbar() {
-      highlightToolbarEl.hidden = true;
-    }
-
     function openCommentDialog(id) {
       const ann = findAnnotationById(id);
       if (!ann) {
@@ -254,22 +216,12 @@ HTML_PAGE = """<!DOCTYPE html>
     }
 
     function renderUI() {
-      hideSelectionToolbar();
-      hideHighlightToolbar();
+      const hasSelection = Boolean(state.selection);
+      const hasHighlight = Boolean(state.highlightId && findAnnotationById(state.highlightId));
 
-      if (state.mode === Mode.SELECTION_ACTIVE && state.selection) {
-        const rect = getSelectionRect();
-        if (rect) {
-          placeToolbar(selectionToolbarEl, rect);
-        }
-      }
-
-      if (state.mode === Mode.HIGHLIGHT_ACTIVE && state.highlightId) {
-        const highlightEl = findHighlightElById(state.highlightId);
-        if (highlightEl) {
-          placeToolbar(highlightToolbarEl, highlightEl.getBoundingClientRect());
-        }
-      }
+      highlightBtnEl.disabled = !hasSelection;
+      commentBtnEl.disabled = !hasSelection && !hasHighlight;
+      removeBtnEl.disabled = !hasHighlight;
 
       if (state.mode === Mode.COMMENT_DIALOG && state.commentTargetId) {
         openCommentDialog(state.commentTargetId);
@@ -305,6 +257,23 @@ HTML_PAGE = """<!DOCTYPE html>
             state.selection = null;
           }
           renderUI();
+          return;
+
+        case 'MENU_INTERACTION_STARTED':
+          if (state.selection || payload.selection) {
+            state.mode = Mode.SELECTION_MENU_ACTIVE;
+            state.selection = state.selection || payload.selection;
+            state.highlightId = null;
+            state.commentTargetId = null;
+          }
+          renderUI();
+          return;
+
+        case 'MENU_INTERACTION_ENDED':
+          if (state.mode === Mode.SELECTION_MENU_ACTIVE) {
+            state.mode = state.selection ? Mode.SELECTION_ACTIVE : Mode.IDLE;
+            renderUI();
+          }
           return;
 
         case 'HIGHLIGHT_SELECTED':
@@ -354,7 +323,7 @@ HTML_PAGE = """<!DOCTYPE html>
           renderDocument();
           if (state.highlightId && !findAnnotationById(state.highlightId)) {
             state.highlightId = null;
-            if (state.mode !== Mode.SELECTION_ACTIVE) {
+            if (state.mode !== Mode.SELECTION_ACTIVE && state.mode !== Mode.SELECTION_MENU_ACTIVE) {
               state.mode = Mode.IDLE;
             }
           }
@@ -410,8 +379,18 @@ HTML_PAGE = """<!DOCTYPE html>
       return matches[0] || null;
     }
 
-    selectionToolbarEl.addEventListener('pointerdown', (event) => {
-      event.preventDefault();
+    topMenuEl.addEventListener('pointerdown', () => {
+      transition('MENU_INTERACTION_STARTED', { selection: getSelectionOffsets() });
+    });
+
+    topMenuEl.addEventListener('pointerup', () => {
+      window.setTimeout(() => {
+        transition('MENU_INTERACTION_ENDED');
+      }, 0);
+    });
+
+    topMenuEl.addEventListener('pointercancel', () => {
+      transition('MENU_INTERACTION_ENDED');
     });
 
     saveCommentEl.addEventListener('click', async () => {
@@ -431,7 +410,7 @@ HTML_PAGE = """<!DOCTYPE html>
       }
     });
 
-    document.getElementById('highlightBtn').addEventListener('click', async () => {
+    highlightBtnEl.addEventListener('click', async () => {
       const selection = state.selection;
       if (!selection) return;
       window.getSelection()?.removeAllRanges();
@@ -439,25 +418,25 @@ HTML_PAGE = """<!DOCTYPE html>
       await mutate({ action: 'add', start: selection.start, end: selection.end });
     });
 
-    document.getElementById('selectionCommentBtn').addEventListener('click', async () => {
+    commentBtnEl.addEventListener('click', async () => {
       const selection = state.selection;
-      if (!selection) return;
-      window.getSelection()?.removeAllRanges();
-      transition('CLEAR_ACTIVE');
-      const annotations = await mutate({ action: 'add', start: selection.start, end: selection.end });
-      if (!annotations) return;
-      const ann = findHighlightForSelection(selection, annotations);
-      if (!ann) return;
-      transition('OPEN_COMMENT_DIALOG', { id: ann.id });
-    });
+      if (selection) {
+        window.getSelection()?.removeAllRanges();
+        transition('CLEAR_ACTIVE');
+        const annotations = await mutate({ action: 'add', start: selection.start, end: selection.end });
+        if (!annotations) return;
+        const ann = findHighlightForSelection(selection, annotations);
+        if (!ann) return;
+        transition('OPEN_COMMENT_DIALOG', { id: ann.id });
+        return;
+      }
 
-    document.getElementById('highlightCommentBtn').addEventListener('click', async () => {
       const id = state.highlightId;
       if (!id) return;
       transition('OPEN_COMMENT_DIALOG', { id });
     });
 
-    document.getElementById('highlightRemoveBtn').addEventListener('click', async () => {
+    removeBtnEl.addEventListener('click', async () => {
       const id = state.highlightId;
       if (!id) return;
       transition('CLEAR_ACTIVE');
@@ -483,7 +462,7 @@ HTML_PAGE = """<!DOCTYPE html>
       if (selection) {
         transition('SELECTION_CHANGED', { selection });
         window.requestAnimationFrame(renderUI);
-      } else {
+      } else if (state.mode !== Mode.SELECTION_MENU_ACTIVE) {
         transition('SELECTION_CHANGED', { selection: null });
       }
     });
@@ -508,15 +487,16 @@ HTML_PAGE = """<!DOCTYPE html>
     });
 
     document.addEventListener('click', (event) => {
-      if (!event.target.closest('#highlightToolbar') && !event.target.closest('.highlight')) {
-        if (state.mode === Mode.HIGHLIGHT_ACTIVE && !getSelectionOffsets()) {
-          transition('CLEAR_ACTIVE');
-        }
+      if (event.target.closest('#topMenu') || event.target.closest('.highlight')) {
+        return;
       }
-      if (!event.target.closest('#selectionToolbar') && !getSelectionOffsets() && state.mode === Mode.SELECTION_ACTIVE) {
+      if (!getSelectionOffsets() && (state.mode === Mode.HIGHLIGHT_ACTIVE || state.mode === Mode.SELECTION_ACTIVE || state.mode === Mode.SELECTION_MENU_ACTIVE)) {
         transition('CLEAR_ACTIVE');
       }
     });
+
+    window.addEventListener('resize', syncTopMenuOffset);
+    window.requestAnimationFrame(syncTopMenuOffset);
 
     loadDocument().catch((error) => {
       console.error(error);
