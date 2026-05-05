@@ -42,6 +42,7 @@ HTML_PAGE = """<!DOCTYPE html>
   <meta charset=\"utf-8\" />
   <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
   <title>Text Highlighter</title>
+  <script>document.title = decodeURIComponent(window.location.pathname.split('/').pop()) + ' - Text Highlighter';</script>
   <style>
     #topMenu {
       position: fixed;
@@ -222,6 +223,10 @@ HTML_PAGE = """<!DOCTYPE html>
       highlightBtnEl.disabled = !hasSelection;
       commentBtnEl.disabled = !hasSelection && !hasHighlight;
       removeBtnEl.disabled = !hasHighlight;
+
+      if (state.fileName) {
+        document.title = state.fileName + ' - Text Highlighter';
+      }
 
       if (state.mode === Mode.COMMENT_DIALOG && state.commentTargetId) {
         openCommentDialog(state.commentTargetId);
