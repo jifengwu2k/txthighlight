@@ -10,22 +10,26 @@ pip install txthighlight
 
 ## Usage
 
-By default it serves the current directory:
+Two subcommands: `serve` (start the web UI) and `extract` (export highlights).
+
+### `serve` — highlight text in the browser
+
+Serve the current directory:
 
 ```bash
-txthighlight
+txthighlight serve
 ```
 
-Run it on a file:
+Serve a single file:
 
 ```bash
-txthighlight --host 0.0.0.0 --port 8080 somefile.txt
+txthighlight serve --host 0.0.0.0 --port 8080 somefile.txt
 ```
 
-Or on a directory:
+Serve a directory:
 
 ```bash
-txthighlight --host 0.0.0.0 --port 8080 ./docs
+txthighlight serve --host 0.0.0.0 --port 8080 ./docs
 ```
 
 Then open:
@@ -35,6 +39,31 @@ http://0.0.0.0:8080
 ```
 
 If you serve a directory, `/` shows a simple directory listing and you can click into files or subdirectories. The listing visually marks directories, likely annotatable text files, `.json` sidecars, and other files.
+
+### `extract` — export highlighted text
+
+Once you've highlighted passages in a file, extract them from the command line:
+
+```bash
+txthighlight extract somefile.txt
+```
+
+By default it prints each highlighted passage on its own line.
+
+Use `--format` to control the output:
+
+```bash
+# Plain text (default) — one highlighted span per line
+txthighlight extract somefile.txt
+
+# Markdown — highlights as blockquotes with comments
+txthighlight extract --format markdown somefile.txt
+
+# JSON — full annotation data including offsets and comments
+txthighlight extract --format json somefile.txt
+```
+
+The extract command reads the `<file>.txt.json` sidecar that was created while highlighting. It does not require the server to be running.
 
 Highlight metadata is stored next to the source file in:
 
@@ -52,6 +81,7 @@ Only UTF-8 text files are supported. Non-UTF-8 files are rejected with an error.
 - lets you remove highlights
 - stores annotation data locally in a JSON sidecar file
 - works with desktop and mobile browsers
+- extracts highlighted text via CLI (plain text, markdown, or JSON)
 
 ### Why this exists
 

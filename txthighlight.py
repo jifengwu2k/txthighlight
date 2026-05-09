@@ -641,6 +641,47 @@ def load_annotations(metadata_path, text_path, text):
     return normalized
 
 
+def extract_highlights(text_path, output_format="text"):
+    # type: (text_type, text_type) -> None
+    """Extract highlighted text from a file and its JSON sidecar."""
+    if not os.path.exists(text_path):
+        raise SystemExit("File not found: %s" % text_path)
+    if os.path.isdir(text_path):
+        raise SystemExit("Path is a directory: %s" % text_path)
+
+    text = load_text(text_path)
+    metadata_path = text_path + ".json"
+
+    try:
+        annotations = load_annotations(metadata_path, text_path, text)
+    except Exception as exc:
+        raise SystemExit("Could not read annotations: %s" % exc)
+
+    if not annotations:
+        return
+
+    if output_format == "json":
+        output = {
+            "source_file": text_path,
+            "annotations": annotations,
+        }
+        print(json.dumps(output, indent=2, ensure_ascii=False))
+        return
+
+    for i, ann in enumerate(annotations):
+        snippet = text[ann["start"]:ann["end"]]
+        if output_format == "markdown":
+            indent = "> "
+            quoted = indent + snippet.replace("\n", "\n" + indent)
+            print(quoted)
+            if ann.get("comment"):
+                print(indent)
+                print(indent + "*%s*" % ann["comment"].replace("\n", "\n" + indent + "*"))
+            print()
+        else:
+            print(snippet)
+
+
 def save_annotations(metadata_path, text_path, annotations):
     # type: (text_type, text_type, list) -> None
     payload = {
@@ -1066,25 +1107,61 @@ def render_directory_listing(root_path, uri_path, filesystem_path):
 def parse_args():
     # type: () -> argparse.Namespace
     parser = argparse.ArgumentParser(
-        description="Serve a plain text file browser with local highlight/comment storage."
+        description="Highlight and extract annotated passages from plain text files."
     )
-    parser.add_argument(
+    subparsers = parser.add_subparsers(dest="command")
+
+    serve_parser = subparsers.add_parser(
+        "serve",
+        help="Start the web UI to highlight and comment on files",
+    )
+    serve_parser.add_argument(
         "path",
         nargs="?",
         default=".",
         help="Path to a plain text file or a directory containing plain text files (default: current directory)",
     )
-    parser.add_argument("--host", default="localhost", help="Host interface to bind to")
-    parser.add_argument("--port", default=8000, type=int, help="Port to listen on")
-    return parser.parse_args()
+    serve_parser.add_argument("--host", default="localhost", help="Host interface to bind to")
+    serve_parser.add_argument("--port", default=8000, type=int, help="Port to listen on")
+
+    extract_parser = subparsers.add_parser(
+        "extract",
+        help="Export highlighted text from a file",
+    )
+    extract_parser.add_argument(
+        "path",
+        help="Path to a plain text file with an associated .json sidecar",
+    )
+    extract_parser.add_argument(
+        "--format",
+        choices=["text", "markdown", "json"],
+        default="text",
+        dest="output_format",
+        help="Output format (default: text)",
+    )
+
+    args = parser.parse_args()
+    if args.command is None:
+        parser.error("a command is required: serve or extract")
+    return args
 
 
 def main():
     # type: () -> None
     args = parse_args()
-    target_path = os.path.abspath(os.path.expanduser(args.path))
+
+    if args.command == "extract":
+        text_path = os.path.abspath(args.path)
+        extract_highlights(text_path, args.output_format)
+        return
+
+    # args.command must be "serve" at this point (validated in parse_args)
+    target_path = os.path.abspath(args.path)
     if not os.path.exists(target_path):
         raise SystemExit("Path not found: %s" % target_path)
+
+    host = args.host
+    port = args.port
 
     if os.path.isdir(target_path):
         root_path = target_path
@@ -1098,13 +1175,13 @@ def main():
 
     app_state = AppState(root_path=root_path, lock=threading.Lock())
 
-    httpd = ThreadingHTTPServer((args.host, args.port), HighlighterHandler)
+    httpd = ThreadingHTTPServer((host, port), HighlighterHandler)
     httpd.app_state = app_state  # type: ignore[attr-defined]
 
     print("Root directory: %s" % root_path)
-    print("Directory view: http://%s:%s/" % (args.host, args.port))
+    print("Directory view: http://%s:%s/" % (host, port))
     if initial_uri_path != "/":
-        print("Initial file: http://%s:%s%s" % (args.host, args.port, initial_uri_path))
+        print("Initial file: http://%s:%s%s" % (host, port, initial_uri_path))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
